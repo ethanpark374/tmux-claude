@@ -1,0 +1,1020 @@
+#!/usr/bin/env python3
+"""
+tmux-cc: Monitor Claude Code instances running in tmux panes.
+
+Usage:
+  claude-monitor                 # One-shot dashboard
+  claude-monitor -w              # Watch mode (auto-refresh every 3s)
+  claude-monitor -n              # Watch mode + macOS notifications on WORKING->IDLE
+  claude-monitor --tmux          # Short summary for tmux status bar
+  claude-monitor --update-panes  # Update tmux pane variables for choose-tree
+  claude-monitor --pick-window   # Sorted window picker (requires fzf)
+  claude-monitor --version       # Show version
+"""
+
+__version__ = "0.1.2"
+
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from datetime import datetime
+
+CLAUDE_DIR = Path.home() / ".claude"
+SESSIONS_DIR = CLAUDE_DIR / "sessions"
+PROJECTS_DIR = CLAUDE_DIR / "projects"
+
+# Binary path marker for versioned Claude installs (no session-file wrapper)
+_CLAUDE_BINARY_MARKER = ".local/share/claude/versions/"
+
+MODEL_CONTEXT = {
+    "claude-opus-4-6": 1_048_576,
+    "claude-opus-4-20250918": 200_000,
+    "claude-sonnet-4-6": 200_000,
+    "claude-sonnet-4-20250514": 200_000,
+    "claude-haiku-4-5-20251001": 200_000,
+}
+DEFAULT_CONTEXT = 200_000
+
+# ANSI Colors
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+BLUE = "\033[34m"
+MAGENTA = "\033[35m"
+CYAN = "\033[36m"
+WHITE = "\033[37m"
+BG_GREEN = "\033[42m"
+BG_RED = "\033[41m"
+BG_BLUE = "\033[44m"
+
+_prev_states = {}
+
+
+def get_tmux_panes():
+    try:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F",
+             "#{session_name}:#{window_index}.#{pane_index}\t#{window_name}\t#{pane_pid}\t#{pane_current_command}"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return []
+        panes = []
+        for line in result.stdout.strip().split("\n"):
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 4:
+                panes.append({
+                    "pane_id": parts[0],
+                    "window_name": parts[1],
+                    "pane_pid": int(parts[2]),
+                    "command": parts[3],
+                })
+        return panes
+    except Exception:
+        return []
+
+
+def find_claude_pid(pane_pid, claude_pids=None):
+    """BFS through process tree (depth ≤ 3) to find a Claude Code process.
+
+    Returns (pid, has_session_file):
+      - (pid, True)  – process has a ~/.claude/sessions/{pid}.json
+      - (pid, False) – process detected via Claude binary path (no session file)
+      - (None, False) – no Claude process found
+
+    claude_pids: pre-computed set of PIDs with session files (fast path).
+    """
+    try:
+        queue = [(str(pane_pid), 0)]
+        visited = set()
+        binary_fallback = None  # pid detected by binary path, no session file
+
+        while queue:
+            current, depth = queue.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
+            try:
+                pid = int(current)
+                # 1. Check session file (preferred)
+                if claude_pids is not None:
+                    if pid in claude_pids:
+                        return pid, True
+                else:
+                    if (SESSIONS_DIR / f"{pid}.json").exists():
+                        return pid, True
+                # 2. Detect by binary path as fallback
+                if binary_fallback is None:
+                    cmd_r = subprocess.run(
+                        ["ps", "-o", "command=", "-p", current],
+                        capture_output=True, text=True, timeout=3
+                    )
+                    cmd = cmd_r.stdout.strip()
+                    exe = cmd.split()[0] if cmd else ""
+                    if (_CLAUDE_BINARY_MARKER in exe or
+                            os.path.basename(exe) in {"claude", "claude-code"}):
+                        binary_fallback = pid
+            except Exception:
+                pass
+            if depth < 3:
+                result = subprocess.run(
+                    ["pgrep", "-P", current],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    for child in result.stdout.strip().split("\n"):
+                        child = child.strip()
+                        if child and child not in visited:
+                            queue.append((child, depth + 1))
+
+        return binary_fallback, False
+    except Exception:
+        return None, False
+
+
+def get_process_state(pid):
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "state=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5
+        )
+        state = result.stdout.strip()
+        return state[0] if state else "?"
+    except Exception:
+        return "?"
+
+
+def get_cpu_usage(pid):
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "%cpu=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+def get_session_info(pid):
+    session_file = SESSIONS_DIR / f"{pid}.json"
+    if not session_file.exists():
+        return None
+    try:
+        with open(session_file) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def get_process_cwd(pid):
+    """Return the working directory of a process (macOS/Linux).
+
+    Falls back to checking direct children if the process CWD is root '/'.
+    """
+    def _lsof_cwd(p):
+        try:
+            r = subprocess.run(
+                ["lsof", "-a", "-p", str(p), "-d", "cwd", "-Fn"],
+                capture_output=True, text=True, timeout=5
+            )
+            for line in r.stdout.strip().split("\n"):
+                if line.startswith("n"):
+                    return line[1:]
+        except Exception:
+            pass
+        return None
+
+    cwd = _lsof_cwd(pid)
+    if cwd and cwd != "/":
+        return cwd
+
+    # Binary may run from '/' — check direct child (e.g., node) for real CWD
+    try:
+        children = subprocess.run(
+            ["pgrep", "-P", str(pid)],
+            capture_output=True, text=True, timeout=5
+        ).stdout.strip().split("\n")
+        for child in children:
+            child = child.strip()
+            if child:
+                child_cwd = _lsof_cwd(int(child))
+                if child_cwd and child_cwd != "/":
+                    return child_cwd
+    except Exception:
+        pass
+
+    return cwd or "?"
+
+
+def get_process_start_ms(pid):
+    """Return process start time in milliseconds using elapsed time from ps."""
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "etime=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5
+        )
+        etime = result.stdout.strip()
+        if not etime:
+            return None
+        # etime format: [[DD-]HH:]MM:SS
+        parts = etime.replace("-", ":").split(":")
+        vals = [int(p) for p in reversed(parts)]
+        elapsed_s = vals[0]
+        if len(vals) > 1:
+            elapsed_s += vals[1] * 60
+        if len(vals) > 2:
+            elapsed_s += vals[2] * 3600
+        if len(vals) > 3:
+            elapsed_s += vals[3] * 86400
+        return int((time.time() - elapsed_s) * 1000)
+    except Exception:
+        return None
+
+
+def find_conversation_file(session_id):
+    if not PROJECTS_DIR.exists():
+        return None
+    for project_dir in PROJECTS_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+        jsonl_file = project_dir / f"{session_id}.jsonl"
+        if jsonl_file.exists():
+            return jsonl_file
+        sub_dir = project_dir / session_id
+        if sub_dir.is_dir():
+            for f in sub_dir.iterdir():
+                if f.suffix == ".jsonl":
+                    return f
+    return None
+
+
+def get_last_usage(conversation_file):
+    if not conversation_file or not conversation_file.exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["tail", "-50", str(conversation_file)],
+            capture_output=True, text=True, timeout=5
+        )
+        last_usage = None
+        last_model = None
+        last_stop = None
+        for line in result.stdout.strip().split("\n"):
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                if entry.get("type") == "assistant" and "message" in entry:
+                    msg = entry["message"]
+                    if "usage" in msg:
+                        last_usage = msg["usage"]
+                        last_model = msg.get("model", "unknown")
+                        last_stop = msg.get("stop_reason", "")
+            except json.JSONDecodeError:
+                continue
+        return {"usage": last_usage, "model": last_model, "stop_reason": last_stop}
+    except Exception:
+        return None
+
+
+def get_last_assistant_text(conversation_file):
+    """Return a short snippet of the last assistant text response."""
+    if not conversation_file or not conversation_file.exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["tail", "-80", str(conversation_file)],
+            capture_output=True, text=True, timeout=5
+        )
+        last_text = None
+        for line in result.stdout.strip().split("\n"):
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                if entry.get("type") == "assistant" and "message" in entry:
+                    for block in entry["message"].get("content", []):
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text", "").strip()
+                            if text:
+                                last_text = text
+            except json.JSONDecodeError:
+                continue
+        return last_text
+    except Exception:
+        return None
+
+
+def get_message_count(conversation_file):
+    if not conversation_file:
+        return 0
+    try:
+        result = subprocess.run(
+            ["grep", "-c", '"type":"assistant"', str(conversation_file)],
+            capture_output=True, text=True, timeout=5
+        )
+        return int(result.stdout.strip())
+    except Exception:
+        return 0
+
+
+def format_duration(started_at_ms):
+    if not started_at_ms:
+        return "?"
+    elapsed = time.time() - (started_at_ms / 1000)
+    if elapsed < 60:
+        return f"{int(elapsed)}s"
+    elif elapsed < 3600:
+        return f"{int(elapsed // 60)}m"
+    else:
+        h = int(elapsed // 3600)
+        m = int((elapsed % 3600) // 60)
+        return f"{h}h{m}m"
+
+
+def format_tokens(n):
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    elif n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def context_bar(used, total, width=20):
+    ratio = min(used / total, 1.0) if total > 0 else 0
+    filled = int(ratio * width)
+    empty = width - filled
+    if ratio < 0.5:
+        color = GREEN
+    elif ratio < 0.75:
+        color = YELLOW
+    else:
+        color = RED
+    bar = f"{color}{'█' * filled}{DIM}{'░' * empty}{RESET}"
+    pct = f"{ratio * 100:.0f}%"
+    return f"[{bar}] {pct}"
+
+
+def shorten_path(path, max_len=35):
+    home = str(Path.home())
+    if path.startswith(home):
+        path = "~" + path[len(home):]
+    if len(path) <= max_len:
+        return path
+    parts = path.split("/")
+    if len(parts) <= 2:
+        return path[:max_len - 2] + ".."
+    return parts[0] + "/.../" + parts[-1]
+
+
+def is_working(state, cpu):
+    return state == "R" or cpu > 5.0
+
+
+def send_notification(title, message):
+    try:
+        if platform.system() == "Darwin":
+            subprocess.run(
+                ["osascript", "-e",
+                 f'display notification "{message}" with title "{title}" sound name "Glass"'],
+                capture_output=True, timeout=5
+            )
+        else:
+            subprocess.run(
+                ["notify-send", title, message],
+                capture_output=True, timeout=5
+            )
+    except Exception:
+        pass
+
+
+def collect_instances():
+    # Pre-compute PIDs with active Claude session files for fast lookup
+    claude_pids = set()
+    if SESSIONS_DIR.exists():
+        for f in SESSIONS_DIR.glob("*.json"):
+            if f.stem.isdigit():
+                claude_pids.add(int(f.stem))
+
+    panes = get_tmux_panes()
+    instances = []
+
+    for pane in panes:
+        claude_pid, has_session = find_claude_pid(pane["pane_pid"], claude_pids)
+        if not claude_pid:
+            continue
+
+        if has_session:
+            session = get_session_info(claude_pid)
+            if not session:
+                continue
+        else:
+            # Binary detected but no session file: build minimal session dict
+            session = {
+                "pid": claude_pid,
+                "cwd": get_process_cwd(claude_pid),
+                "startedAt": get_process_start_ms(claude_pid),
+                "sessionId": None,
+            }
+
+        state = get_process_state(claude_pid)
+        cpu = get_cpu_usage(claude_pid)
+        session_id = session.get("sessionId") or ""
+        conv_file = find_conversation_file(session_id) if session_id else None
+        usage_info = get_last_usage(conv_file)
+        msg_count = get_message_count(conv_file)
+
+        instances.append({
+            "pane": pane,
+            "pid": claude_pid,
+            "session": session,
+            "state": state,
+            "cpu": cpu,
+            "usage_info": usage_info,
+            "msg_count": msg_count,
+            "conv_file": conv_file,
+        })
+
+    return instances
+
+
+def check_notifications(instances):
+    global _prev_states
+
+    for inst in instances:
+        pid = inst["pid"]
+        working = is_working(inst["state"], inst["cpu"])
+        prev_working = _prev_states.get(pid)
+
+        if prev_working is True and not working:
+            pane = inst["pane"]
+            usage_info = inst["usage_info"]
+            ctx_pct = ""
+            if usage_info and usage_info.get("usage"):
+                u = usage_info["usage"]
+                total_in = (u.get("input_tokens", 0)
+                            + u.get("cache_read_input_tokens", 0)
+                            + u.get("cache_creation_input_tokens", 0))
+                model = usage_info.get("model", "unknown")
+                max_ctx = MODEL_CONTEXT.get(model, DEFAULT_CONTEXT)
+                ctx_pct = f" | Context {total_in * 100 // max_ctx}%"
+
+            duration = format_duration(inst["session"].get("startedAt"))
+
+            text_snippet = ""
+            last_text = get_last_assistant_text(inst.get("conv_file"))
+            if last_text:
+                snippet = " ".join(last_text.split())[:120]
+                if len(last_text) > 120:
+                    snippet += "…"
+                text_snippet = f' | "{snippet}"'
+
+            send_notification(
+                "Claude Code - Done",
+                f"{pane['pane_id']} ({pane['window_name']}) completed{ctx_pct} | {duration}{text_snippet}"
+            )
+
+        _prev_states[pid] = working
+
+
+def _build_pane_info(inst):
+    """Format CC status string for a single instance."""
+    working = is_working(inst["state"], inst["cpu"])
+    status = "WORKING" if working else "IDLE"
+    duration = format_duration(inst["session"].get("startedAt"))
+    usage_info = inst["usage_info"]
+    if usage_info and usage_info.get("usage"):
+        u = usage_info["usage"]
+        total_in = (u.get("input_tokens", 0)
+                    + u.get("cache_read_input_tokens", 0)
+                    + u.get("cache_creation_input_tokens", 0))
+        model = usage_info.get("model", "unknown")
+        max_ctx = MODEL_CONTEXT.get(model, DEFAULT_CONTEXT)
+        pct = total_in * 100 // max_ctx
+        model_short = (model.replace("claude-", "")
+                       .replace("-20250514", "")
+                       .replace("-20250918", ""))
+        return f"[CC: {status} | {model_short} | ctx {pct}% | {duration}]"
+    return f"[CC: {status} | {duration}]"
+
+
+def update_tmux_panes(instances):
+    inst_map = {inst["pane"]["pane_id"]: inst for inst in instances}
+    all_panes = get_tmux_panes()
+
+    # --- Per-pane @cc_info (for in-pane status use) ---
+    for pane in all_panes:
+        pane_id = pane["pane_id"]
+        inst = inst_map.get(pane_id)
+        if inst:
+            try:
+                subprocess.run(
+                    ["tmux", "set-option", "-p", "-t", pane_id,
+                     "@cc_info", _build_pane_info(inst)],
+                    capture_output=True, timeout=3
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                subprocess.run(
+                    ["tmux", "set-option", "-p", "-t", pane_id, "-u", "@cc_info"],
+                    capture_output=True, timeout=3
+                )
+            except Exception:
+                pass
+
+    # --- Window-level @cc_info for choose-tree (prefix+w) ---
+    # Group instances by window ("session:window_index" = pane_id up to last ".")
+    window_insts: dict = {}
+    for inst in instances:
+        win_id = inst["pane"]["pane_id"].rsplit(".", 1)[0]
+        window_insts.setdefault(win_id, []).append(inst)
+
+    all_win_ids = {p["pane_id"].rsplit(".", 1)[0] for p in all_panes}
+
+    for win_id in all_win_ids:
+        insts = window_insts.get(win_id, [])
+        if insts:
+            if len(insts) == 1:
+                info = _build_pane_info(insts[0])
+            else:
+                working = sum(1 for i in insts if is_working(i["state"], i["cpu"]))
+                idle = len(insts) - working
+                max_pct = 0
+                for i in insts:
+                    u_info = i["usage_info"]
+                    if u_info and u_info.get("usage"):
+                        u = u_info["usage"]
+                        total_in = (u.get("input_tokens", 0)
+                                    + u.get("cache_read_input_tokens", 0)
+                                    + u.get("cache_creation_input_tokens", 0))
+                        model = u_info.get("model", "unknown")
+                        max_ctx = MODEL_CONTEXT.get(model, DEFAULT_CONTEXT)
+                        max_pct = max(max_pct, total_in * 100 // max_ctx)
+                info = f"[CC×{len(insts)}: {working}W {idle}I | ctx {max_pct}%]"
+            try:
+                subprocess.run(
+                    ["tmux", "set-option", "-w", "-t", win_id, "@cc_window_info", info],
+                    capture_output=True, timeout=3
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                subprocess.run(
+                    ["tmux", "set-option", "-w", "-t", win_id, "-u", "@cc_window_info"],
+                    capture_output=True, timeout=3
+                )
+            except Exception:
+                pass
+
+
+def render_dashboard_fzf(instances):
+    """Window picker with preview.
+
+    Left  — one line per window, sorted: working CC → idle CC → no CC
+            search filters by window name; up/down moves window by window
+    Right — full dashboard detail (render_window_detail) for hovered window
+    Enter — switch tmux client to selected window
+    """
+    if not instances:
+        print(f"{DIM}No Claude Code instances found in tmux.{RESET}")
+        return
+
+    now = datetime.now().strftime("%H:%M:%S")
+    working_count = sum(1 for i in instances if is_working(i["state"], i["cpu"]))
+    idle_count = len(instances) - working_count
+    fzf_header = (f"tmux-cc  {len(instances)} instances  "
+                  f"{working_count} working, {idle_count} idle  {now}"
+                  f"  │  Enter: switch  Esc: close")
+
+    r = subprocess.run(
+        ["tmux", "list-windows", "-a", "-F",
+         "#{session_name}:#{window_index}\t#{window_name}\t#{window_panes}"],
+        capture_output=True, text=True, timeout=5
+    )
+
+    win_insts: dict = {}
+    for inst in instances:
+        wid = inst["pane"]["pane_id"].rsplit(".", 1)[0]
+        win_insts.setdefault(wid, []).append(inst)
+
+    working_wins, idle_cc_wins, no_cc_wins = [], [], []
+    for line in (r.stdout or "").strip().split("\n"):
+        if not line:
+            continue
+        parts = line.split("\t")
+        wid, wname, npanes = parts[0], parts[1], parts[2]
+        insts = win_insts.get(wid, [])
+        n_working = sum(1 for i in insts if is_working(i["state"], i["cpu"]))
+        entry = (wid, wname, npanes, insts, n_working)
+        if insts and n_working > 0:
+            working_wins.append(entry)
+        elif insts:
+            idle_cc_wins.append(entry)
+        else:
+            no_cc_wins.append(entry)
+
+    win_ids = []
+    display_lines = []
+
+    for group in [working_wins, idle_cc_wins, no_cc_wins]:
+        for wid, wname, npanes, insts, n_working in group:
+            if insts:
+                n = len(insts)
+                if n == 1:
+                    info = _build_pane_info(insts[0])
+                else:
+                    idle = n - n_working
+                    max_pct = 0
+                    for i in insts:
+                        u_info = i["usage_info"]
+                        if u_info and u_info.get("usage"):
+                            u = u_info["usage"]
+                            total_in = (u.get("input_tokens", 0)
+                                        + u.get("cache_read_input_tokens", 0)
+                                        + u.get("cache_creation_input_tokens", 0))
+                            m = u_info.get("model", "unknown")
+                            mc = MODEL_CONTEXT.get(m, DEFAULT_CONTEXT)
+                            max_pct = max(max_pct, total_in * 100 // mc)
+                    info = f"[CC×{n}: {n_working}W {idle}I | ctx {max_pct}%]"
+                label = (f"{GREEN}● WORKING{RESET}" if n_working
+                         else f"{BLUE}○ IDLE   {RESET}")
+                line = f"  {label}  {BOLD}{wname:<22}{RESET}  {DIM}{info}{RESET}"
+            else:
+                line = f"  {DIM}  ─         {wname}{RESET}"
+            win_ids.append(wid)
+            display_lines.append(line)
+
+    if not shutil.which("fzf"):
+        render_dashboard(instances)
+        return
+
+    monitor_bin = (shutil.which("claude-monitor")
+                   or str(Path.home() / ".local/bin/claude-monitor"))
+    preview_cmd = f"{monitor_bin} --window-detail {{1}} 2>/dev/null"
+
+    fzf_input = "\n".join(f"{win_ids[i]}\t{display_lines[i]}"
+                          for i in range(len(win_ids)))
+    result = subprocess.run(
+        ["fzf", "--ansi", "--no-sort", "--no-multi",
+         "--prompt", "  window> ",
+         "--with-nth", "2..", "--delimiter", "\t",
+         "--height", "100%", "--border",
+         "--header", fzf_header,
+         "--preview", preview_cmd,
+         "--preview-window", "right:60%:wrap"],
+        input=fzf_input, capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        selected_wid = result.stdout.strip().split("\t")[0]
+        if selected_wid:
+            subprocess.run(["tmux", "switch-client", "-t", selected_wid],
+                           capture_output=True)
+
+
+def render_window_detail(win_id, instances):
+    """Print full dashboard detail for a single window (used as fzf preview)."""
+    group = [i for i in instances
+             if i["pane"]["pane_id"].rsplit(".", 1)[0] == win_id]
+    if not group:
+        print(f"{DIM}No CC instances in this window.{RESET}")
+        return
+
+    win_name = group[0]["pane"]["window_name"]
+    n = len(group)
+    w = sum(1 for i in group if is_working(i["state"], i["cpu"]))
+
+    print(f"{BOLD}{CYAN}{'─' * 50}{RESET}")
+    print(f"{BOLD}  [{win_id}] {win_name}{RESET}  "
+          f"{DIM}{n} pane{'s' if n > 1 else ''}{RESET}")
+    print(f"{BOLD}{CYAN}{'─' * 50}{RESET}\n")
+
+    for i, inst in enumerate(group):
+        is_last = (i == n - 1)
+        branch = "  └─" if is_last else "  ├─"
+        cont   = "    " if is_last else "  │ "
+
+        pane = inst["pane"]
+        session = inst["session"]
+        cpu = inst["cpu"]
+        usage_info = inst["usage_info"]
+        working = is_working(inst["state"], inst["cpu"])
+
+        status_icon = (f"{BG_GREEN}{BOLD}{WHITE} WORKING {RESET}" if working
+                       else f"{BG_BLUE}{BOLD}{WHITE}  IDLE   {RESET}")
+        duration = format_duration(session.get("startedAt"))
+        cwd = shorten_path(session.get("cwd", "?"))
+
+        print(f"{branch}  {status_icon}  {BOLD}{pane['pane_id']}{RESET}")
+        print(f"{cont}   {DIM}Dir:{RESET} {CYAN}{cwd}{RESET}")
+        print(f"{cont}   {DIM}PID:{RESET} {session.get('pid', '?')}"
+              f"  {DIM}Duration:{RESET} {YELLOW}{duration}{RESET}"
+              f"  {DIM}CPU:{RESET} {cpu:.1f}%"
+              f"  {DIM}Messages:{RESET} {inst['msg_count']}")
+
+        if usage_info and usage_info.get("usage"):
+            usage = usage_info["usage"]
+            model = usage_info.get("model", "unknown")
+            input_tokens = usage.get("input_tokens", 0)
+            cache_read = usage.get("cache_read_input_tokens", 0)
+            cache_create = usage.get("cache_creation_input_tokens", 0)
+            output_tokens = usage.get("output_tokens", 0)
+            total_input = input_tokens + cache_read + cache_create
+            max_ctx = MODEL_CONTEXT.get(model, DEFAULT_CONTEXT)
+            bar = context_bar(total_input, max_ctx)
+            model_short = (model.replace("claude-", "")
+                           .replace("-20250514", "")
+                           .replace("-20250918", ""))
+            print(f"{cont}   {DIM}Model:{RESET} {MAGENTA}{model_short}{RESET}"
+                  f"  Context: {bar}"
+                  f"  ({format_tokens(total_input)}/{format_tokens(max_ctx)})")
+            print(f"{cont}   {DIM}Tokens{RESET}  in: {format_tokens(input_tokens)}"
+                  f"  cached: {format_tokens(cache_read)}"
+                  f"  out: {format_tokens(output_tokens)}")
+        else:
+            print(f"{cont}   {DIM}(no usage data yet){RESET}")
+
+        if not is_last:
+            print(f"  │")
+
+
+def render_pick_window(instances):
+    """Sorted window picker via fzf with detail preview.
+    Working CC windows first, then idle CC, then no CC.
+    """
+    r = subprocess.run(
+        ["tmux", "list-windows", "-a", "-F",
+         "#{session_name}:#{window_index}\t#{window_name}\t#{window_panes}"],
+        capture_output=True, text=True, timeout=5
+    )
+    if r.returncode != 0:
+        print("Could not list tmux windows.")
+        return
+
+    win_insts: dict = {}
+    for inst in instances:
+        wid = inst["pane"]["pane_id"].rsplit(".", 1)[0]
+        win_insts.setdefault(wid, []).append(inst)
+
+    working_wins, idle_cc_wins, no_cc_wins = [], [], []
+    for line in r.stdout.strip().split("\n"):
+        if not line:
+            continue
+        parts = line.split("\t")
+        wid, wname, npanes = parts[0], parts[1], parts[2]
+        insts = win_insts.get(wid, [])
+        n_working = sum(1 for i in insts if is_working(i["state"], i["cpu"]))
+        entry = (wid, wname, npanes, insts, n_working)
+        if insts and n_working > 0:
+            working_wins.append(entry)
+        elif insts:
+            idle_cc_wins.append(entry)
+        else:
+            no_cc_wins.append(entry)
+
+    win_ids = []
+    display_lines = []
+
+    for group in [working_wins, idle_cc_wins, no_cc_wins]:
+        for wid, wname, npanes, insts, n_working in group:
+            if insts:
+                n = len(insts)
+                if n == 1:
+                    info = _build_pane_info(insts[0])
+                else:
+                    idle = n - n_working
+                    max_pct = 0
+                    for i in insts:
+                        u_info = i["usage_info"]
+                        if u_info and u_info.get("usage"):
+                            u = u_info["usage"]
+                            total_in = (u.get("input_tokens", 0)
+                                        + u.get("cache_read_input_tokens", 0)
+                                        + u.get("cache_creation_input_tokens", 0))
+                            m = u_info.get("model", "unknown")
+                            mc = MODEL_CONTEXT.get(m, DEFAULT_CONTEXT)
+                            max_pct = max(max_pct, total_in * 100 // mc)
+                    info = f"[CC×{n}: {n_working}W {idle}I | ctx {max_pct}%]"
+                label = (f"{GREEN}● WORKING{RESET}" if n_working
+                         else f"{BLUE}○ IDLE   {RESET}")
+                line = f"  {label}  {BOLD}[{wid}]{RESET} {wname:<20}  {DIM}{info}{RESET}"
+            else:
+                line = f"  {DIM}  ─         [{wid}] {wname}{RESET}"
+            win_ids.append(wid)
+            display_lines.append(line)
+
+    if not shutil.which("fzf"):
+        # No fzf: print sorted list and exit
+        print(f"{BOLD}{CYAN}{'─' * 60}{RESET}")
+        print(f"{BOLD}{CYAN}  Windows  (sorted by CC status){RESET}"
+              f"  {DIM}install fzf for interactive mode{RESET}")
+        print(f"{BOLD}{CYAN}{'─' * 60}{RESET}\n")
+        for line in display_lines:
+            print(line)
+        print()
+        return
+
+    monitor_bin = shutil.which("claude-monitor") or f"{Path.home()}/.local/bin/claude-monitor"
+    preview_cmd = f"{monitor_bin} --window-detail {{1}}"
+
+    fzf_input = "\n".join(f"{win_ids[i]}\t{display_lines[i]}"
+                          for i in range(len(win_ids)))
+    result = subprocess.run(
+        ["fzf", "--ansi", "--no-sort",
+         "--prompt", "  window> ",
+         "--with-nth", "2..", "--delimiter", "\t",
+         "--height", "100%", "--reverse", "--border",
+         "--preview", preview_cmd,
+         "--preview-window", "right:55%:wrap"],
+        input=fzf_input, capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        selected_wid = result.stdout.strip().split("\t")[0]
+        subprocess.run(["tmux", "switch-client", "-t", selected_wid],
+                       capture_output=True)
+
+
+def render_tmux_status(instances):
+    if not instances:
+        print("")
+        return
+
+    working = sum(1 for i in instances if is_working(i["state"], i["cpu"]))
+    idle = len(instances) - working
+
+    parts = []
+    if working > 0:
+        parts.append(f"#[fg=green,bold]{working} working#[default]")
+    if idle > 0:
+        parts.append(f"{idle} idle")
+
+    print(f"#[fg=magenta]CC#[default] {' '.join(parts)}")
+
+
+def render_dashboard(instances):
+    if not instances:
+        print(f"{DIM}No Claude Code instances found in tmux.{RESET}")
+        return
+
+    now = datetime.now().strftime("%H:%M:%S")
+    working_count = sum(1 for i in instances if is_working(i["state"], i["cpu"]))
+    idle_count = len(instances) - working_count
+
+    print(f"{BOLD}{CYAN}{'=' * 76}{RESET}")
+    print(f"{BOLD}{CYAN}  tmux-cc{RESET}  {DIM}{len(instances)} instances"
+          f" ({GREEN}{working_count} working{RESET}{DIM},"
+          f" {BLUE}{idle_count} idle{RESET}{DIM})  {now}{RESET}")
+    print(f"{BOLD}{CYAN}{'=' * 76}{RESET}")
+    print()
+
+    # Group instances by window, preserving encounter order
+    window_groups: dict = {}
+    win_order = []
+    for inst in instances:
+        win_id = inst["pane"]["pane_id"].rsplit(".", 1)[0]
+        if win_id not in window_groups:
+            window_groups[win_id] = []
+            win_order.append(win_id)
+        window_groups[win_id].append(inst)
+
+    for g_idx, win_id in enumerate(win_order):
+        group = window_groups[win_id]
+        win_name = group[0]["pane"]["window_name"]
+        n = len(group)
+        w = sum(1 for i in group if is_working(i["state"], i["cpu"]))
+        idle = n - w
+
+        # Window group header
+        if n > 1:
+            header = f"▸ [{win_id}] {BOLD}{win_name}{RESET}"
+            summary = (f"{DIM}{n} panes  "
+                       f"{RESET}{GREEN}{w} working{RESET}{DIM},"
+                       f" {RESET}{BLUE}{idle} idle{RESET}")
+            fill = "─" * max(2, 50 - len(win_id) - len(win_name))
+            print(f"  {header}  {DIM}{fill}{RESET}  {summary}")
+        else:
+            header = f"▸ [{win_id}] {BOLD}{win_name}{RESET}"
+            fill = "─" * max(2, 62 - len(win_id) - len(win_name))
+            print(f"  {header}  {DIM}{fill}{RESET}")
+
+        for i, inst in enumerate(group):
+            is_last = (i == n - 1)
+            branch = "  └─" if is_last else "  ├─"
+            cont   = "    " if is_last else "  │ "
+
+            pane = inst["pane"]
+            session = inst["session"]
+            cpu = inst["cpu"]
+            usage_info = inst["usage_info"]
+            working = is_working(inst["state"], inst["cpu"])
+
+            if working:
+                status_icon = f"{BG_GREEN}{BOLD}{WHITE} WORKING {RESET}"
+            else:
+                status_icon = f"{BG_BLUE}{BOLD}{WHITE}  IDLE   {RESET}"
+
+            duration = format_duration(session.get("startedAt"))
+            cwd = shorten_path(session.get("cwd", "?"))
+
+            print(f"{branch}  {status_icon}  {BOLD}{pane['pane_id']}{RESET}")
+            print(f"{cont}   {DIM}Dir:{RESET} {CYAN}{cwd}{RESET}")
+            print(f"{cont}   {DIM}PID:{RESET} {session.get('pid', '?')}"
+                  f"  {DIM}Duration:{RESET} {YELLOW}{duration}{RESET}"
+                  f"  {DIM}CPU:{RESET} {cpu:.1f}%"
+                  f"  {DIM}Messages:{RESET} {inst['msg_count']}")
+
+            if usage_info and usage_info.get("usage"):
+                usage = usage_info["usage"]
+                model = usage_info.get("model", "unknown")
+                input_tokens = usage.get("input_tokens", 0)
+                cache_read = usage.get("cache_read_input_tokens", 0)
+                cache_create = usage.get("cache_creation_input_tokens", 0)
+                output_tokens = usage.get("output_tokens", 0)
+                total_input = input_tokens + cache_read + cache_create
+                max_ctx = MODEL_CONTEXT.get(model, DEFAULT_CONTEXT)
+                bar = context_bar(total_input, max_ctx)
+                model_short = (model.replace("claude-", "")
+                               .replace("-20250514", "")
+                               .replace("-20250918", ""))
+                print(f"{cont}   {DIM}Model:{RESET} {MAGENTA}{model_short}{RESET}"
+                      f"  Context: {bar}"
+                      f"  ({format_tokens(total_input)}/{format_tokens(max_ctx)})")
+                print(f"{cont}   {DIM}Tokens{RESET}  in: {format_tokens(input_tokens)}"
+                      f"  cached: {format_tokens(cache_read)}"
+                      f"  out: {format_tokens(output_tokens)}")
+            else:
+                print(f"{cont}   {DIM}(no usage data yet){RESET}")
+
+            if not is_last:
+                print(f"  │")
+
+        if g_idx < len(win_order) - 1:
+            print()
+
+    print()
+
+
+def main():
+    if "--version" in sys.argv or "-V" in sys.argv:
+        print(f"tmux-cc {__version__}")
+        return
+
+    tmux_mode = "--tmux" in sys.argv
+    watch_mode = "--watch" in sys.argv or "-w" in sys.argv
+    notify_mode = "--notify" in sys.argv or "-n" in sys.argv
+    update_panes_mode = "--update-panes" in sys.argv
+    pick_window_mode = "--pick-window" in sys.argv
+
+    if "--window-detail" in sys.argv:
+        idx = sys.argv.index("--window-detail")
+        win_id = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
+        instances = collect_instances()
+        render_window_detail(win_id, instances)
+        return
+
+    if pick_window_mode:
+        instances = collect_instances()
+        render_dashboard_fzf(instances)
+        return
+
+    if notify_mode:
+        watch_mode = True
+
+    while True:
+        if watch_mode and not tmux_mode:
+            os.system("clear")
+
+        instances = collect_instances()
+
+        if update_panes_mode:
+            update_tmux_panes(instances)
+            return
+
+        if tmux_mode:
+            render_tmux_status(instances)
+            return
+
+        if notify_mode:
+            check_notifications(instances)
+
+        render_dashboard(instances)
+
+        if not watch_mode:
+            break
+        time.sleep(3)
+
+
+if __name__ == "__main__":
+    main()
