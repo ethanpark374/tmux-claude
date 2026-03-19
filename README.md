@@ -1,4 +1,4 @@
-# tmux-cc
+# tmux-claude
 
 Monitor all your [Claude Code](https://docs.anthropic.com/en/docs/claude-code) instances running across tmux panes — at a glance.
 
@@ -25,14 +25,14 @@ See which instances are **working** or **idle**, how much **context window** is 
 **One-liner (curl):**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ethanpark374/tmux-cc/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ethanpark374/tmux-claude/main/install.sh | bash
 ```
 
 **Or clone:**
 
 ```bash
-git clone https://github.com/ethanpark374/tmux-cc.git
-cd tmux-cc
+git clone https://github.com/ethanpark374/tmux-claude.git
+cd tmux-claude
 ./install.sh
 ```
 
@@ -58,12 +58,12 @@ After installation, the tmux status bar shows a live summary that refreshes ever
 Press `prefix + m` to open an fzf-powered window picker:
 
 ```
-  tmux-cc  7 instances  2 working, 5 idle  20:44  │  Enter: switch  Esc: close
+  tmux-claude  7 instances  2 working, 5 idle  20:44  │  Enter: switch  Esc: close
   window>                                          │
   ● WORKING  trading           [CC: WORK | opus..]│  ──────────────────────────
   ● WORKING  test              [CC×2: 2W 0I | 15%]│    [6:0] test  2 panes
   ○ IDLE     search-youtube    [CC: IDLE | opus..]│  ──────────────────────────
-  ○ IDLE     git-tmux-cc       [CC: IDLE | son..]  │
+  ○ IDLE     git-tmux-claude       [CC: IDLE | son..]  │
   ─          zsh                                   │  ├─  WORKING  6:0.0
                                                    │  │   Dir: ~/workspace/test
                                                    │  │   Model: sonnet-4-6
@@ -99,7 +99,7 @@ claude-monitor
 
 ```
 ============================================================================
-  tmux-cc  7 instances (2 working, 5 idle)  20:44:13
+  tmux-claude  7 instances (2 working, 5 idle)  20:44:13
 ============================================================================
 
   ▸ [5:1] trading  ──── 2 panes  1 working, 1 idle ──────────────────────
@@ -153,7 +153,7 @@ Claude Code - Done
 
 ## How It Works
 
-tmux-cc reads data from Claude Code's local files:
+tmux-claude reads data from Claude Code's local files:
 
 - **Session files** (`~/.claude/sessions/{pid}.json`) — Maps PIDs to session IDs, working directories, and start times
 - **Conversation files** (`~/.claude/projects/{project}/{sessionId}.jsonl`) — Message history with API usage data
@@ -163,7 +163,7 @@ No API calls are made. Everything is read from local files.
 
 ### Process Detection
 
-tmux-cc uses a BFS search (depth ≤ 3) through each pane's process tree to find Claude Code:
+tmux-claude uses a BFS search (depth ≤ 3) through each pane's process tree to find Claude Code:
 
 1. Check if any process has a session file in `~/.claude/sessions/{pid}.json`
 2. If not, detect by binary path (`~/.local/share/claude/versions/`)
@@ -202,7 +202,7 @@ Or manually:
 
 ```bash
 rm ~/.local/bin/claude-monitor
-# Remove the tmux-cc block from ~/.tmux.conf (between >>> tmux-cc begin/end markers)
+# Remove the tmux-claude block from ~/.tmux.conf (between >>> tmux-claude begin/end markers)
 tmux source-file ~/.tmux.conf
 ```
 

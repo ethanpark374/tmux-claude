@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# tmux-cc installer
+# tmux-claude installer
 # Usage:
-#   git clone https://github.com/ethanpark374/tmux-cc && cd tmux-cc && ./install.sh
-#   curl -fsSL https://raw.githubusercontent.com/ethanpark374/tmux-cc/main/install.sh | bash
+#   git clone https://github.com/ethanpark374/tmux-claude && cd tmux-claude && ./install.sh
+#   curl -fsSL https://raw.githubusercontent.com/ethanpark374/tmux-claude/main/install.sh | bash
 
-REPO_URL="https://raw.githubusercontent.com/ethanpark374/tmux-cc/main"
+REPO_URL="https://raw.githubusercontent.com/ethanpark374/tmux-claude/main"
 INSTALL_DIR="${HOME}/.local/bin"
 SCRIPT_NAME="claude-monitor"
-MARKER_BEGIN="# >>> tmux-cc begin >>>"
-MARKER_END="# <<< tmux-cc end <<<"
+MARKER_BEGIN="# >>> tmux-claude begin >>>"
+MARKER_END="# <<< tmux-claude end <<<"
 
 # Detect tmux.conf location
 if [ -f "${HOME}/.config/tmux/tmux.conf" ]; then
@@ -21,10 +21,10 @@ else
     TMUX_CONF="${HOME}/.tmux.conf"
 fi
 
-info()  { printf "\033[34m[tmux-cc]\033[0m %s\n" "$1"; }
-ok()    { printf "\033[32m[tmux-cc]\033[0m %s\n" "$1"; }
-warn()  { printf "\033[33m[tmux-cc]\033[0m %s\n" "$1"; }
-error() { printf "\033[31m[tmux-cc]\033[0m %s\n" "$1"; exit 1; }
+info()  { printf "\033[34m[tmux-claude]\033[0m %s\n" "$1"; }
+ok()    { printf "\033[32m[tmux-claude]\033[0m %s\n" "$1"; }
+warn()  { printf "\033[33m[tmux-claude]\033[0m %s\n" "$1"; }
+error() { printf "\033[31m[tmux-claude]\033[0m %s\n" "$1"; exit 1; }
 
 # --- Pre-flight checks ---
 command -v python3 >/dev/null 2>&1 || error "python3 is required but not found."
@@ -45,7 +45,7 @@ else
     ok "fzf already installed ($(fzf --version))."
 fi
 
-info "Installing tmux-cc..."
+info "Installing tmux-claude..."
 
 # --- Install script ---
 mkdir -p "${INSTALL_DIR}"
@@ -71,7 +71,7 @@ fi
 
 # --- Patch tmux.conf ---
 TMUX_BLOCK=$(cat <<'TMUXEOF'
-# tmux-cc: Claude Code Monitor (https://github.com/ethanpark374/tmux-cc)
+# tmux-claude: Claude Code Monitor (https://github.com/ethanpark374/tmux-claude)
 set -g status-interval 5
 set -g status-right-length 80
 set -g status-right '#(python3 ~/.local/bin/claude-monitor --tmux) | %H:%M %d-%b'
@@ -89,15 +89,15 @@ touch "${TMUX_CONF}"
 
 # Remove old block if present (idempotent)
 if grep -qF "${MARKER_BEGIN}" "${TMUX_CONF}"; then
-    info "Removing previous tmux-cc config..."
+    info "Removing previous tmux-claude config..."
     sed -i.tmp "/${MARKER_BEGIN}/,/${MARKER_END}/d" "${TMUX_CONF}"
     rm -f "${TMUX_CONF}.tmp"
 fi
 
 # Backup
-if [ ! -f "${TMUX_CONF}.bak.tmux-cc" ]; then
-    cp "${TMUX_CONF}" "${TMUX_CONF}.bak.tmux-cc"
-    info "Backed up ${TMUX_CONF} -> ${TMUX_CONF}.bak.tmux-cc"
+if [ ! -f "${TMUX_CONF}.bak.tmux-claude" ]; then
+    cp "${TMUX_CONF}" "${TMUX_CONF}.bak.tmux-claude"
+    info "Backed up ${TMUX_CONF} -> ${TMUX_CONF}.bak.tmux-claude"
 fi
 
 # Append config block
@@ -107,7 +107,7 @@ fi
     echo "${TMUX_BLOCK}"
     echo "${MARKER_END}"
 } >> "${TMUX_CONF}"
-ok "Added tmux-cc config to ${TMUX_CONF}"
+ok "Added tmux-claude config to ${TMUX_CONF}"
 
 # --- Reload tmux if running ---
 if tmux info >/dev/null 2>&1; then

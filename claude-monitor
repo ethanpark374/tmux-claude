@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tmux-cc: Monitor Claude Code instances running in tmux panes.
+tmux-claude: Monitor Claude Code instances running in tmux panes.
 
 Usage:
   claude-monitor                 # One-shot dashboard
@@ -595,7 +595,7 @@ def render_dashboard_fzf(instances):
     now = datetime.now().strftime("%H:%M:%S")
     working_count = sum(1 for i in instances if is_working(i["state"], i["cpu"]))
     idle_count = len(instances) - working_count
-    fzf_header = (f"tmux-cc  {len(instances)} instances  "
+    fzf_header = (f"tmux-claude  {len(instances)} instances  "
                   f"{working_count} working, {idle_count} idle  {now}"
                   f"  │  Enter: switch  Esc: close")
 
@@ -873,7 +873,7 @@ def render_dashboard(instances):
     idle_count = len(instances) - working_count
 
     print(f"{BOLD}{CYAN}{'=' * 76}{RESET}")
-    print(f"{BOLD}{CYAN}  tmux-cc{RESET}  {DIM}{len(instances)} instances"
+    print(f"{BOLD}{CYAN}  tmux-claude{RESET}  {DIM}{len(instances)} instances"
           f" ({GREEN}{working_count} working{RESET}{DIM},"
           f" {BLUE}{idle_count} idle{RESET}{DIM})  {now}{RESET}")
     print(f"{BOLD}{CYAN}{'=' * 76}{RESET}")
@@ -968,7 +968,7 @@ def render_dashboard(instances):
 
 def main():
     if "--version" in sys.argv or "-V" in sys.argv:
-        print(f"tmux-cc {__version__}")
+        print(f"tmux-claude {__version__}")
         return
 
     tmux_mode = "--tmux" in sys.argv

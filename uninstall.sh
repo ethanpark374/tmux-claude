@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# tmux-cc uninstaller
+# tmux-claude uninstaller
 
 INSTALL_DIR="${HOME}/.local/bin"
 SCRIPT_NAME="claude-monitor"
-MARKER_BEGIN="# >>> tmux-cc begin >>>"
-MARKER_END="# <<< tmux-cc end <<<"
+MARKER_BEGIN="# >>> tmux-claude begin >>>"
+MARKER_END="# <<< tmux-claude end <<<"
 
 # Detect tmux.conf location
 if [ -f "${HOME}/.config/tmux/tmux.conf" ]; then
@@ -15,9 +15,9 @@ else
     TMUX_CONF="${HOME}/.tmux.conf"
 fi
 
-info()  { printf "\033[34m[tmux-cc]\033[0m %s\n" "$1"; }
-ok()    { printf "\033[32m[tmux-cc]\033[0m %s\n" "$1"; }
-warn()  { printf "\033[33m[tmux-cc]\033[0m %s\n" "$1"; }
+info()  { printf "\033[34m[tmux-claude]\033[0m %s\n" "$1"; }
+ok()    { printf "\033[32m[tmux-claude]\033[0m %s\n" "$1"; }
+warn()  { printf "\033[33m[tmux-claude]\033[0m %s\n" "$1"; }
 
 # --- Remove script ---
 if [ -f "${INSTALL_DIR}/${SCRIPT_NAME}" ]; then
@@ -31,7 +31,7 @@ fi
 if [ -f "${TMUX_CONF}" ] && grep -qF "${MARKER_BEGIN}" "${TMUX_CONF}"; then
     sed -i.tmp "/${MARKER_BEGIN}/,/${MARKER_END}/d" "${TMUX_CONF}"
     rm -f "${TMUX_CONF}.tmp"
-    ok "Removed tmux-cc config from ${TMUX_CONF}"
+    ok "Removed tmux-claude config from ${TMUX_CONF}"
 
     # Reload tmux if running
     if tmux info >/dev/null 2>&1; then
@@ -39,7 +39,7 @@ if [ -f "${TMUX_CONF}" ] && grep -qF "${MARKER_BEGIN}" "${TMUX_CONF}"; then
         ok "Reloaded tmux config."
     fi
 else
-    warn "No tmux-cc config found in ${TMUX_CONF}"
+    warn "No tmux-claude config found in ${TMUX_CONF}"
 fi
 
 # --- Clean up pane variables ---
@@ -52,4 +52,4 @@ fi
 
 echo ""
 ok "Uninstall complete!"
-info "Backup of your tmux.conf is at: ${TMUX_CONF}.bak.tmux-cc"
+info "Backup of your tmux.conf is at: ${TMUX_CONF}.bak.tmux-claude"
