@@ -838,7 +838,7 @@ def render_pick_window(instances):
          "--height", "100%", "--reverse", "--border",
          "--preview", preview_cmd,
          "--preview-window", "right:55%:wrap"],
-        input=fzf_input, capture_output=True, text=True
+        input=fzf_input, stdout=subprocess.PIPE, text=True
     )
     if result.returncode == 0:
         selected_wid = result.stdout.strip().split("\t")[0]
