@@ -675,7 +675,7 @@ def render_dashboard_fzf(instances):
          "--header", fzf_header,
          "--preview", preview_cmd,
          "--preview-window", "right:60%:wrap"],
-        input=fzf_input, capture_output=True, text=True
+        input=fzf_input, stdout=subprocess.PIPE, text=True
     )
     if result.returncode == 0:
         selected_wid = result.stdout.strip().split("\t")[0]
